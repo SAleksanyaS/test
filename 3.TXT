@@ -665,3 +665,87 @@ sber_bot.messaging.command_handler([
     CommandHandler(get_peer, "get_peer", PeerType.PEERTYPE_GROUP,
                    description="Вывести peer.id и peer.type"),
 ])
+
+
+
+
+
+
+
+
+
+
+
+
+
+Что такое Peer
+python
+Копировать
+Редактировать
+class Peer:
+    id: int            # числовой идентификатор чат‑сессии или пользователя
+    type: PeerType     # откуда это сообщение: личка, группа, канал, тред и т.д.
+peer.id — это числовой ID конкретного чата или пользователя.
+
+Если сообщение пришло в личку, то peer.id — это ID пользователя, который пишет боту.
+
+Если в группе, то peer.id — это ID группы (канала).
+
+peer.type — из какого именно «контекста» пришло сообщение. Возможные значения (enum PeerType):
+
+PEERTYPE_PRIVATE — личный чат с ботом
+
+PEERTYPE_GROUP — группа
+
+PEERTYPE_CHANNEL — канал (в СберЧате — публичный или приватный)
+
+PEERTYPE_THREAD — обсуждение (тред) внутри группы
+
+и ещё пара служебных типов
+
+Чем отличается message.peer и message.sender_peer
+В обновлениях UpdateMessage есть два важных поля:
+
+message.peer
+— объект Peer, показывающий, в какой чат пришло сообщение.
+Например, если бот в группе с ID 123, то message.peer.id == 123, message.peer.type == PEERTYPE_GROUP.
+
+message.sender_peer
+— объект Peer, показывающий, кто написал это сообщение (откуда его взять, чтобы отправить ответ конкретному пользователю внутри группы).
+
+В личке message.sender_peer.id == message.peer.id (пользователь и чат совпадают).
+
+В группе message.sender_peer.id — это ID пользователя, а message.peer.id — ID группы.
+
+Пример
+python
+Копировать
+Редактировать
+def handler(update: UpdateMessage):
+    chat = update.peer           # объект Peer — где (какой чат) пришло сообщение
+    author = update.sender_peer  # объект Peer — кто отправил сообщение
+    
+    chat_id   = chat.id          # например, 123456 (ID группы или личного чата)
+    author_id = author.id        # например, 7890   (ID конкретного пользователя)
+    
+    # отправить ответ в тот же чат:
+    bot.messaging.send_message(chat, "Привет!")
+    
+    # отправить приватный ответ автору (если бот в группе):
+    bot.messaging.send_message(chat, "Привет, <@{author_id}>!", uid=author_id)
+chat/peer нужен, чтобы знать, куда слать сообщения.
+
+sender_peer нужен, чтобы знать кого упомянуть (uid=) или проверить права (например, if sender_peer.id in ADMIN_IDS).
+
+Кратко
+Peer — структура { id: int, type: PeerType }.
+
+peer.id — числовой идентификатор чата или пользователя.
+
+peer.type — тип контекста (личка, группа, канал, тред).
+
+message.peer — откуда пришло сообщение (куда отвечать).
+
+message.sender_peer — кто написал (какому пользователю в группе можно отправить личное или пометить ответом).
+
+Теперь, зная это, вы легко проверите «кто» и «куда» при обработке команд и сообщений.
