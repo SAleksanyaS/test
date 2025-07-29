@@ -1,0 +1,533 @@
+src/
+│
+├── DataBase.py                # Работа с базой данных (SQLAlchemy)
+├── Entities.py                # Конфигурация (Config)
+├── KnowledgeSearch.py         # Поисковая модель (TF-IDF + cosine similarity)
+├── OnBoardingBot.py           # Основной класс бота
+├── utils/
+│   └── excel_utils.py         # Вспомогательная утилита для Excel выгрузки
+└── __init__.py                # (опционально) если модульный импорт
+
+
+
+src/DataBase.py
+
+
+from dataclasses import dataclass
+from enum import Enum
+from typing import List
+from dialog_bot_sdk.utils import Logger
+from sber_sberchat_bot_kits.DB import Filter
+from sqlalchemy import Table, Column, Integer, Text, MetaData
+from sber_sberchat_bot_kits import DB
+from sber_sberchat_bot_kits.utils import logger_decorator
+
+logger = Logger(__name__)
+
+@dataclass(frozen=True)
+class QAEntry:
+    id: int
+    question: str
+    answer: str
+
+    def __str__(self):
+        return f"QAEntry(id={self.id}, question='{self.question}', answer='{self.answer}')"
+
+class QAEnum(Enum):
+    ID = "id"
+    QUESTION = "question"
+    ANSWER = "answer"
+
+class DataBase(DB.DataBase):
+    def __init__(self, cfg: dict) -> None:
+        super().__init__(cfg)
+        self.meta = MetaData()
+        self.schema = cfg["schema"]
+
+        self.qna_table = Table(
+            'qna', self.meta,
+            Column(QAEnum.ID.value, Integer, primary_key=True, autoincrement=True),
+            Column(QAEnum.QUESTION.value, Text),
+            Column(QAEnum.ANSWER.value, Text),
+            schema=self.schema
+        )
+        self.meta.create_all(self.engine)
+
+    @logger_decorator(logger)
+    def insert_qna(self, question: str, answer: str) -> None:
+        self.insert(self.qna_table, {
+            QAEnum.QUESTION.value: question.strip(),
+            QAEnum.ANSWER.value: answer.strip()
+        })
+
+    @logger_decorator(logger)
+    def delete_by_id(self, entry_id: int) -> bool:
+        return self.delete(self.qna_table, filters=[
+            Filter(QAEnum.ID.value, entry_id)
+        ])
+
+    @logger_decorator(logger)
+    def select_all_questions_answers(self) -> List[QAEntry]:
+        rows = self.select(self.qna_table)
+        return [QAEntry(row.id, row.question, row.answer) for row in rows]
+
+
+
+
+src/KnowledgeSearch.py
+
+from typing import Optional
+import numpy as np
+from src.DataBase import DataBase
+
+def calculate_tf(documents):
+    word_freq = {}
+    document_count = len(documents)
+    for doc in documents:
+        words = doc.split()
+        unique_words = set(words)
+        for word in unique_words:
+            count = words.count(word)
+            word_freq.setdefault(word, []).append(count / document_count)
+    return word_freq
+
+def calculate_idf(word_freq, num_docs):
+    return {
+        word: np.log((num_docs + 1) / (len(freqs) + 1)) + 1
+        for word, freqs in word_freq.items()
+    }
+
+def generate_tfidf_vector(text, word_freq, idf_values):
+    words = text.split()
+    return np.array([
+        words.count(word) / len(words) * idf_values.get(word, 0)
+        for word in sorted(word_freq.keys())
+    ])
+
+def cosine_distance(a, b):
+    denom = np.linalg.norm(a) * np.linalg.norm(b)
+    return np.dot(a, b) / denom if denom != 0 else 0
+
+class KnowledgeSearch:
+    def __init__(self, db: DataBase):
+        self.db = db
+        self.refresh_data()
+
+    def refresh_data(self):
+        all_data = self.db.select_all_questions_answers()
+        self.questions = [item.question for item in all_data]
+        self.answers = [item.answer for item in all_data]
+        self.ids = [item.id for item in all_data]
+        self.word_freq = calculate_tf(self.questions)
+        self.idf_values = calculate_idf(self.word_freq, len(self.questions))
+        self.question_vectors = [
+            generate_tfidf_vector(q, self.word_freq, self.idf_values)
+            for q in self.questions
+        ]
+
+    def find_best_answer(self, input_question: str, threshold: float = 0.25) -> Optional[str]:
+        input_vector = generate_tfidf_vector(input_question, self.word_freq, self.idf_values)
+        best_score, best_idx = 0, -1
+        for idx, vec in enumerate(self.question_vectors):
+            score = cosine_distance(input_vector, vec)
+            if score > best_score:
+                best_score, best_idx = score, idx
+        return self.answers[best_idx] if best_score >= threshold else None
+
+    def add_question_and_answer(self, question: str, answer: str) -> bool:
+        try:
+            self.db.insert_qna(question, answer)
+            self.refresh_data()
+            return True
+        except Exception as e:
+            print(f"Ошибка при добавлении: {e}")
+            return False
+
+    def delete_by_id(self, entry_id: int) -> bool:
+        try:
+            result = self.db.delete_by_id(entry_id)
+            self.refresh_data()
+            return result
+        except Exception as e:
+            print(f"Ошибка удаления по ID: {e}")
+            return False
+
+    def get_all(self):
+        return self.db.select_all_questions_answers()
+
+
+src/excel_utils.py
+
+import pandas as pd
+from typing import List
+from src.DataBase import QAEntry
+import os
+
+def save_to_excel(data: List[QAEntry], path: str) -> None:
+    """
+    Сохраняет список QAEntry в Excel-файл по указанному пути.
+    Если путь включает директорию, создаёт её при необходимости.
+    
+    :param data: Список записей базы знаний.
+    :param path: Путь, по которому сохранить Excel-файл.
+    """
+    # Создание директории, если не существует
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    # Формируем таблицу и сохраняем
+    df = pd.DataFrame([{
+        "ID": entry.id,
+        "Question": entry.question,
+        "Answer": entry.answer
+    } for entry in data])
+    df.to_excel(path, index=False)
+
+
+
+src/OnBoardingBot.py
+
+from dialog_bot_sdk.bot import DialogBot
+from dialog_bot_sdk.entities.messaging import CommandHandler, UpdateMessage, MessageHandler, MessageContentType
+from dialog_bot_sdk.entities.peers import PeerType
+from dialog_bot_sdk.utils import Logger
+from sber_sberchat_bot_kits.HealthCheck import HealthCheck
+from sber_sberchat_bot_kits.Metrics import Metrics
+from sber_sberchat_bot_kits.utils import logger_decorator
+from src.KnowledgeSearch import KnowledgeSearch
+from src.Entities import Config
+from src.DataBase import DataBase
+from src.excel_utils import save_to_excel
+
+
+logger = Logger(__name__)
+
+class OnBoardingBot:
+    def __init__(self, config: dict):
+        self.metrics = Metrics(**config["Prometheus"])
+        self.bot = DialogBot.create_bot(self.metrics.add_metrics_to_config(config["Bot"]))
+        self.health = HealthCheck(**config["HealthCheck"]["server"])
+        self.health.set_default_bot_checkers(self.bot, **config["HealthCheck"]["params"])
+        self.deadline = config["HealthCheck"]["params"]["deadline"]
+        self.config = Config(**config["Config"])
+        self.db = DataBase(config["DataBase"])
+        self.kb_search = KnowledgeSearch(self.db)
+        self.processing_messages = True
+
+        self.register_listeners(config["Commands"])
+        self.bot.messaging.message_handler([
+            MessageHandler(self.handle_message, MessageContentType.TEXT_MESSAGE)
+        ])
+
+    @logger_decorator(logger)
+    def register_listeners(self, commands: dict):
+        self.bot.messaging.command_handler([
+            CommandHandler(self.start, **commands["start"]),
+            CommandHandler(self.stop_processing, **commands["stop"]),
+            CommandHandler(self.add_to_base, **commands["add_to_base"]),
+            CommandHandler(self.delete_from_base, **commands["delete_from_base"]),
+            CommandHandler(self.load_base, **commands["load_base"]),
+        ])
+
+    @logger_decorator(logger)
+    def run(self):
+        self.health.start()
+        self.bot.updates.on_updates(do_read_message=True, do_register_commands=True, health_check_deadline=self.deadline)
+
+    def is_admin(self, user_id: int) -> bool:
+        return user_id in self.config.flag_admin
+
+    @logger_decorator(logger)
+    def start(self, message: UpdateMessage):
+        if not self.is_admin(message.sender_peer.id):
+            return self.bot.messaging.reply(message.peer, [message.mid], "Вы не можете выполнить эту команду.")
+        self.processing_messages = True
+        self.bot.messaging.reply(message.peer, [message.mid], "Обработка сообщений включена.")
+
+    @logger_decorator(logger)
+    def stop_processing(self, message: UpdateMessage):
+        if not self.is_admin(message.sender_peer.id):
+            return self.bot.messaging.reply(message.peer, [message.mid], "Вы не можете выполнить эту команду.")
+        self.processing_messages = False
+        self.bot.messaging.reply(message.peer, [message.mid], "Обработка сообщений остановлена.")
+
+    @logger_decorator(logger)
+    def add_to_base(self, message: UpdateMessage):
+        if not self.is_admin(message.sender_peer.id):
+            return self.bot.messaging.reply(message.peer, [message.mid], "Вы не можете выполнить эту команду.")
+        text = message.message.text_message.text.replace("/add_to_base", "").strip()
+        parts = text.split(";", 1)
+        if len(parts) != 2:
+            return self.bot.messaging.reply(message.peer, [message.mid], "Формат: /add_to_base Вопрос;Ответ")
+        success = self.kb_search.add_question_and_answer(*map(str.strip, parts))
+        self.bot.messaging.reply(message.peer, [message.mid], "Добавлено." if success else "Ошибка добавления.")
+
+    @logger_decorator(logger)
+    def delete_from_base(self, message: UpdateMessage):
+        if not self.is_admin(message.sender_peer.id):
+            return self.bot.messaging.reply(message.peer, [message.mid], "Вы не можете выполнить эту команду.")
+        text = message.message.text_message.text.replace("/delete_from_base", "").strip()
+        if not text.isdigit():
+            return self.bot.messaging.reply(message.peer, [message.mid], "Формат: /delete_from_base ID")
+        success = self.kb_search.delete_by_id(int(text))
+        self.bot.messaging.reply(message.peer, [message.mid], "Удалено." if success else "Ошибка удаления.")
+
+    @logger_decorator(logger)
+    def load_base(self, message: UpdateMessage):
+        if not self.is_admin(message.sender_peer.id):
+            return self.bot.messaging.reply(message.peer, [message.mid], "Вы не можете выполнить эту команду.")
+        entries = self.kb_search.get_all()
+        excel_path = "data/knowledge_export.xlsx"
+	save_to_excel(base, excel_path)
+        self.bot.messaging.reply(message.peer, [message.mid], "База выгружена.")
+
+    @logger_decorator(logger)
+    def handle_message(self, message: UpdateMessage):
+        if not self.processing_messages:
+            return
+        sender_id = message.sender_peer.id
+        chat_type = message.peer.type
+        text = message.message.text_message.text.strip()
+        bot_tag = '@' + self.bot.user_info.user.data.nick.lower()
+        if bot_tag not in text.lower():
+            return
+        cleaned = text.replace(bot_tag, '').strip()
+        if chat_type == PeerType.PEERTYPE_PRIVATE and not self.is_admin(sender_id):
+            return self.bot.messaging.reply(message.peer, [message.mid], "Дальнейшие коммуникации ведутся в чате онбординга.")
+        answer = self.kb_search.find_best_answer(cleaned)
+        self.bot.messaging.reply(message.peer, [message.mid], answer or "Извините, я пока не могу ответить на этот вопрос.")
+
+
+
+
+
+
+
+
+
+
+
+
+Мы предлагаем многоэтапный подход: сначала нормализуем пользовательский запрос (удаляем пунктуацию, приводим к нижнему регистру, удаляем служебные слова и выполняем лемматизацию/стемминг), затем расширяем запрос с помощью списка синонимов, а потом сравниваем полученные ключевые слова с записями в базе знаний. Для оценки релевантности используются взвешенные совпадения (например, на основе TF-IDF или BM25). Если максимальная оценка совпадения не превышает порог (например, равна нулю), возвращается «я не знаю ответа на этот вопрос». Такой подход учитывает как точные, так и семантические соответствия.
+Нормализация текста: удаляем пунктуацию и стоп-слова (вопросные слова «как», «что», «где» и т.д.), приводим всё к нижнему регистру. Приводим слова к базовой форме (лемматизация/стемминг), чтобы объединять разные формы одного слова
+habr.com
+. Это гарантирует регистронезависимый поиск и поддержку морфологических форм («стул» = «СТУЛ», «стул» = «стулья»
+vc.ru
+).
+Учет синонимов: для каждого ключевого слова можем расширить запрос синонимами. Например, если в словаре синонимов указано, что «диван» = «софа», то при наличии одного из них считаем совпадением
+vc.ru
+. Благодаря этому поиск становится более «смысловым» – система учитывает различные формулировки одного вопроса
+vc.ru
+habr.com
+.
+Взвешенное сравнение: для каждой записи базы знаний (каждого вопроса) рассчитываем меру совпадения с запросом. Можно использовать TF-IDF или формулу BM25, учитывая частоту термина в документе и обратную частоту в коллекции
+habr.com
+. Чем реже встречается слово (и чаще – в запросе и ответе), тем больше его вес. Итоговая оценка – это сумма весов по всем общим терминам. Выбираем запись с наибольшим баллом. Если лучший балл равен 0 (то есть нет совпадений по ключевым словам и синонимам), считаем, что ответ не найден.
+Пороговое решение: для контроля точности можно ввести пороговое значение (например, минимальный вес суммарных совпадений). Если всё же несколько записей набрали близкие баллы, можно дополнительно проверять контекст или уточнять запрос. Но при отсутствии явных совпадений возвращаем стандартный ответ «я не знаю ответа на этот вопрос».
+
+
+
+Рекомендации по наполнению базы знаний
+Разнообразие формулировок: Для каждой тематической области в базе лучше добавить несколько вариантов вопросов с разной лексикой и синонимами. Например, если есть запись для «Как приобрести билет?», добавьте версии «Как купить билет?», «Где купить билет?» и т.д. Это расширит покрытие ключевых слов
+minervasoft.ru
+vc.ru
+.
+Контекст в записях: Каждая запись должна быть самодостаточной и компактной – отвечать на конкретный вопрос
+doc.nextbot.ru
+. Заголовки или метки записи не участвуют в поиске, поэтому важно явно указать в тексте все ключевые понятия. Например, вместо сухого списка «Часы работы» сразу укажите «Наши часы работы: ежедневно с 9:00 до 21:00»
+doc.nextbot.ru
+.
+Ключевые слова и теги: Желательно вручную связывать каждую запись с набором релевантных ключевых слов или тегов. При пополнении БД записывайте синонимичные слова или фразы, чтобы увеличить шансы совпадения. При необходимости пересмотрите записи, если пользователи отмечают, что поиск возвращает неточные результаты – добавляйте новые ключевые слова и формулировки
+minervasoft.ru
+.
+Структура и сегментация: Информацию следует разбивать на логические блоки (по темам или вопросам) – это ускоряет поиск и повышение точности
+doc.nextbot.ru
+. Убедитесь, что каждый блок описывает только один аспект (например, только адрес или только часы работы) и содержит полное пояснение.
+Поддержка обновления: Регулярно анализируйте логи запросов и запросы без ответов, чтобы выявить пробелы. Так можно обнаружить новые синонимы и формулировки, которые надо добавить. С течением времени база знаний должна пополняться исходя из реальных запросов пользователей, что повысит точность поиска и уменьшит число «не знаю» ответов
+habr.com
+
+
+
+
+# src/KnowledgeSearch.py
+import math
+import re
+from typing import Optional, List, Dict
+from src.DataBase import QAEntry, DataBase
+
+# Стоп‑слова на русском
+STOP_WORDS = { "и","в","во","не","что","он","на","я","с","как","а","то","все","она","так","его",
+               "но","да","ты","к","у","же","вы","за","бы","по","ее","мне","быть","чем","был",
+               "него","до","вас","ни","из","ли","нет","о","если","или","кто","сегодня" }
+
+# Словарь синонимов
+SYNONYMS: Dict[str,List[str]] = {
+    "привет": ["здравствуй","добрый"],
+    "пока": ["до_свидания","увидимся"],
+    "магазин": ["супермаркет","бутик"],
+    # … ваши расширения …
+}
+
+def normalize(text: str) -> List[str]:
+    """Нормализация: lowercase, удаление пунктуации, стоп‑слов, коротких слов."""
+    text = text.lower()
+    text = re.sub(r'[^а-яё\s]', ' ', text)
+    tokens = text.split()
+    return [t for t in tokens if len(t)>2 and t not in STOP_WORDS]
+
+def expand_synonyms(tokens: List[str]) -> List[str]:
+    """Добавление синонимов к списку токенов."""
+    expanded = list(tokens)
+    for t in tokens:
+        if t in SYNONYMS:
+            for syn in SYNONYMS[t]:
+                if syn not in expanded:
+                    expanded.append(syn)
+        else:
+            for key, syns in SYNONYMS.items():
+                if t in syns and key not in expanded:
+                    expanded.append(key)
+    return expanded
+
+class KnowledgeSearch:
+    """
+    Семантический поиск ответа в базе QAEntry.
+    """
+    def __init__(self, db: DataBase):
+        self.db = db
+        self.reload()
+
+    def reload(self):
+        """Загружает данные из БД и готовит токены."""
+        entries = self.db.select_all_questions_answers()  # List[QAEntry]
+        self.entries: List[QAEntry] = entries
+        self.questions_tokens: List[List[str]] = []
+        for e in entries:
+            toks = normalize(e.question)
+            toks = expand_synonyms(toks)
+            self.questions_tokens.append(toks)
+
+    def find_best_answer(self, query: str) -> Optional[str]:
+        """
+        Возвращает лучший ответ или None.
+        Алгоритм: нормализация запроса, расширение синонимами,
+        затем подсчёт взвешенных совпадений.
+        """
+        q_tokens = normalize(query)
+        q_tokens = expand_synonyms(q_tokens)
+        if not q_tokens:
+            return None
+
+        best_score = 0.0
+        best_idx = -1
+
+        # Считаем score для каждой записи
+        for idx, docs in enumerate(self.questions_tokens):
+            # простой подсчёт: количество общих токенов с весом
+            score = 0.0
+            for t in q_tokens:
+                if t in docs:
+                    score += 1.0  # можно добавить вес из IDF, но без сторонних
+            if score > best_score:
+                best_score, best_idx = score, idx
+
+        if best_idx >= 0 and best_score > 0:
+            return self.entries[best_idx].answer
+        return None
+
+    def add_question_and_answer(self, q: str, a: str) -> bool:
+        res = self.db.insert_qna(q, a)
+        self.reload()
+        return True
+
+    def delete_by_id(self, entry_id: int) -> bool:
+        ok = self.db.delete_by_id(entry_id)
+        self.reload()
+        return ok
+
+    def get_all(self) -> List[QAEntry]:
+        return self.db.select_all_questions_answers()
+
+
+
+
+# src/OnBoardingBot.py
+from dialog_bot_sdk.bot import DialogBot
+from dialog_bot_sdk.entities.messaging import CommandHandler, UpdateMessage, MessageHandler, MessageContentType
+from dialog_bot_sdk.entities.peers import PeerType
+from dialog_bot_sdk.utils import Logger
+from sber_sberchat_bot_kits.HealthCheck import HealthCheck
+from sber_sberchat_bot_kits.Metrics import Metrics
+from sber_sberchat_bot_kits.utils import logger_decorator
+
+from src.Entities import Config
+from src.DataBase import DataBase, QAEntry
+from src.KnowledgeSearch import KnowledgeSearch
+from src.excel_utils import save_to_excel
+
+logger = Logger(__name__)
+
+class OnBoardingBot:
+    def __init__(self, config: dict):
+        # … инициализация HealthCheck, Metrics, Config …
+        self.db = DataBase(config["DataBase"])
+        self.kb = KnowledgeSearch(self.db)
+        # … регистрация команд …
+        self.bot.messaging.command_handler([
+            CommandHandler(self.add_to_base, **config["Commands"]["add_to_base"]),
+            CommandHandler(self.delete_from_base, **config["Commands"]["delete_from_base"]),
+            CommandHandler(self.load_base, **config["Commands"]["load_base"]),
+        ])
+        self.bot.messaging.message_handler([
+            MessageHandler(self.handle_message, MessageContentType.TEXT_MESSAGE)
+        ])
+
+    @logger_decorator(logger)
+    def add_to_base(self, message: UpdateMessage):
+        # проверка админа …
+        text = message.message.text_message.text.replace("/add_to_base","",1).strip()
+        q,a = map(str.strip, text.split(";",1))
+        self.kb.add_question_and_answer(q,a)
+        self.bot.messaging.reply(message.peer, [message.mid], "Добавлено.")
+
+    @logger_decorator(logger)
+    def delete_from_base(self, message: UpdateMessage):
+        text = message.message.text_message.text.replace("/delete_from_base","",1).strip()
+        idx = int(text)
+        if self.kb.delete_by_id(idx):
+            self.bot.messaging.reply(message.peer, [message.mid], f"Удалено ID={idx}")
+        else:
+            self.bot.messaging.reply(message.peer, [message.mid], "ID не найден.")
+
+    @logger_decorator(logger)
+    def load_base(self, message: UpdateMessage):
+        entries: List[QAEntry] = self.kb.get_all()
+        save_to_excel(entries, "data/knowledge_export.xlsx")
+        self.bot.messaging.send_file(message.peer, "data/knowledge_export.xlsx")
+        self.bot.messaging.reply(message.peer, [message.mid], "Выгрузка готова.")
+
+    @logger_decorator(logger)
+    def handle_message(self, message: UpdateMessage):
+        text = message.message.text_message.text
+        if f"@{self.bot.user_info.user.data.nick.lower()}" not in text.lower():
+            return
+        # вырезаем упоминание
+        query = text.lower().replace(f"@{self.bot.user_info.user.data.nick.lower()}","").strip()
+        ans = self.kb.find_best_answer(query)
+        self.bot.messaging.reply(
+            message.peer, [message.mid],
+            ans or "я не знаю ответа на этот вопрос"
+        )
+
+
+
+import pandas as pd
+import os
+from typing import List
+from src.DataBase import QAEntry
+
+def save_to_excel(data: List[QAEntry], path: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    df = pd.DataFrame([{
+        "ID": e.id, "Question": e.question, "Answer": e.answer
+    } for e in data])
+    df.to_excel(path, index=False)
