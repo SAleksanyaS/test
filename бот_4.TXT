@@ -1,0 +1,403 @@
+Убедиться, что в requirements.txt перечислены pandas, openpyxl и numpy.
+pandas>=1.5.0
+openpyxl  # для эксель
+
+Опция 1 (если /tmp writeable):
+ENV TMPDIR=/tmp
+
+
+
+Опция 2 (если /tmp readonly):
+dockerfile
+Копировать
+Редактировать
+RUN mkdir -p /data/tmp && chown root:root /data/tmp && chmod 1777 /data/tmp
+ENV TMPDIR=/data/tmp
+
+
+
+import tempfile
+print(tempfile.gettempdir())
+
+
+
+
+
+
+import os
+from src.excel_utils import save_qna_to_temp_excel
+
+class OnBoardingBot:
+
+    def __init__(...):
+        # ...
+        self.bot.messaging.command_handler([
+            CommandHandler(self.add_to_base,   **config["Commands"]["add_to_base"]),
+            CommandHandler(self.delete_from_base, **config["Commands"]["delete_from_base"]),
+            CommandHandler(self.load_base,     **config["Commands"]["load_base"]),
+        ])
+        # ...
+
+    @logger_decorator(logger)
+    def load_base(self, message: UpdateMessage):
+        # Могут только админы: проверяем, если message.peer это private peer
+        # либо пришло из ЛС
+        # Чтобы расширить: можно хранить список админов в config или БД
+        entries = self.search.get_all()
+        if not entries:
+            self.bot.messaging.send_message(message.peer, "База знаний пуста.")
+            return
+        path = save_qna_to_temp_excel(entries)
+        # отправка файла
+        self.bot.messaging.send_file(message.peer, path, name="qna_export.xlsx",
+                                     text="Вот текущая база Q&A")
+        # Optionally удалить файл
+        os.unlink(path)
+
+
+# src/excel_utils.py
+
+import pandas as pd
+import tempfile
+from typing import List
+from src.DataBase import QAEntry
+
+def save_qna_to_temp_excel(entries: List[QAEntry]) -> str:
+    """
+    Сохраняет список QAEntry в временный xlsx-файл.
+    Возвращает путь к файлу.
+    """
+    data = [
+        {"ID": e.id, "Question": e.question, "Answer": e.answer}
+        for e in entries
+    ]
+    df = pd.DataFrame(data)
+    tmp = tempfile.NamedTemporaryFile(prefix="qna_export_", suffix=".xlsx", delete=False)
+    df.to_excel(tmp.name, index=False)
+    tmp.close()
+    return tmp.name
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import tempfile
+import pandas as pd
+
+def export_base_to_excel(session, qna_model):
+    # session — SQLAlchemy session, qna_model — ORM модель
+    qnas = session.query(qna_model).all()
+    data = [
+        {"ID": q.id, "Question": q.question, "Answer": q.answer}
+        for q in qnas
+    ]
+    df = pd.DataFrame(data)
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
+    df.to_excel(tmp.name, index=False)
+    tmp.close()
+    return tmp.name  # затем отправим через SDK
+
+# Пример использования в хендлере:
+file_path = export_base_to_excel(session, QnAModel)
+bot.messaging.send_file_sync(peer, file_path, name="qna_export.xlsx")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import tempfile
+import pandas as pd
+
+def export_qna_to_temp_excel(qna_records: list[tuple[int, str, str]]) -> str:
+    """
+    Принимает список записей (id, вопрос, ответ),
+    сохраняет в excel-файл и возвращает путь к нему.
+    """
+    df = pd.DataFrame(qna_records, columns=["ID","Question","Answer"])
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
+    df.to_excel(tmp.name, index=False)
+    tmp.close()
+    return tmp.name
+
+
+from src.excel_utils import export_qna_to_temp_excel
+
+@admin_command("export", "Выгрузить базу Q&A в Excel")
+def handle_export_command(params):
+    peer = params.peer
+    records = session.query(QnAModel.id, QnAModel.question, QnAModel.answer).all()
+    file_path = export_qna_to_temp_excel(records)
+    bot.send_file(peer, file_path, name="knowledge_base.xlsx")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+kb = KnowledgeBase(excel_path='data/knowledge_base.xlsx', synonym_path='data/synonyms.txt')
+answer = kb.find_best_answer(user_query)
+
+
+
+
+
+
+import re
+import math
+import logging
+from collections import Counter, defaultdict
+from typing import List, Dict, Tuple, Set
+import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+class SynonymDictionary:
+    """
+    Простая реализация словаря синонимов.
+    Здесь вы можете загрузить файл с парами синонимов.
+    """
+    def __init__(self, path: str = None):
+        self.synonyms: Dict[str, Set[str]] = defaultdict(set)
+        if path:
+            self._load(path)
+
+    def _load(self, path: str):
+        try:
+            with open(path, encoding='utf‑8') as f:
+                for line in f:
+                    a, b = line.strip().split(',')
+                    self.synonyms[a].add(b)
+                    self.synonyms[b].add(a)
+            logger.info("Synonyms loaded: %d entries", len(self.synonyms))
+        except Exception:
+            logger.exception("Failed to load synonyms from %s", path)
+
+    def expand(self, tokens: List[str]) -> Set[str]:
+        result = set(tokens)
+        for t in tokens:
+            result.update(self.synonyms.get(t, []))
+        return result
+
+class KnowledgeBase:
+    """
+    Высоко‑точный поиск ответа в базе знаний.
+    Использует TF-IDF + синонимы + продвинутую фильтрацию стоп-слов.
+    """
+    BASE_STOP = {
+        # расширенный список стоп-слов (наречия, служебные)
+        "что","где","как","почему","когда","чтобы","это","не","же","ли","если",
+        "или","а","но","так","также","очень","уже","еще","вот","только","сам",
+        "в","на","с","по","из","от","до","за","для","о","об","про","к","со"
+    }
+
+    def __init__(self, excel_path: str, synonym_path: str = None):
+        self.syn = SynonymDictionary(synonym_path) if synonym_path else None
+        self.qa: List[Tuple[List[str], str]] = []
+        self.idf: Dict[str, float] = {}
+        self.doc_tfidf: List[Dict[str, float]] = []
+        self.doc_norm: List[float] = []
+        self._load_excel(excel_path)
+
+    def _tokenize(self, text: str) -> List[str]:
+        text = re.sub(r'[^0-9A-Za-zА-Яа-яЁё]+', ' ', text.lower())
+        return [tok for tok in text.split() if tok and tok not in self.BASE_STOP]
+
+    def _load_excel(self, path: str):
+        df = pd.read_excel(path, dtype=str)
+        if 'Question' not in df or 'Answer' not in df:
+            raise ValueError("Excel должен содержать столбцы 'Question' и 'Answer'")
+        for _, row in df.iterrows():
+            q = row['Question'].strip()
+            a = row['Answer'].strip()
+            tokens = self._tokenize(q)
+            if self.syn:
+                tokens = list(self.syn.expand(tokens))
+            if not tokens:
+                continue
+            self.qa.append((tokens, a))
+        logger.info("Loaded %d QA pairs", len(self.qa))
+        self._compute_tfidf()
+
+    def _compute_tfidf(self):
+        N = len(self.qa)
+        df_counts = Counter()
+        for tokens, _ in self.qa:
+            df_counts.update(set(tokens))
+        self.idf = {w: math.log((N + 1) / (df_counts[w] + 1)) + 1.0 for w in df_counts}
+        for tokens, _ in self.qa:
+            tf = Counter(tokens)
+            vec = {w: tf[w] * self.idf[w] for w in tf}
+            norm = math.sqrt(sum(v * v for v in vec.values()))
+            self.doc_tfidf.append(vec)
+            self.doc_norm.append(norm)
+        logger.info("TF-IDF vectors built")
+
+    def find_best_answer(self, query: str, threshold: float = 0.25) -> str:
+        tokens = self._tokenize(query)
+        if self.syn:
+            tokens = list(self.syn.expand(tokens))
+        if not tokens:
+            logger.debug("Empty tokens after processing query")
+            return "Извините, я пока не могу ответить на этот вопрос."
+        tfq = Counter(tokens)
+        vecq = {w: tfq[w] * self.idf.get(w, math.log(len(self.qa)+1)+1) for w in tfq}
+        normq = math.sqrt(sum(v * v for v in vecq.values()))
+        best_i, best_sim = -1, 0.0
+        for i, (vec, norm) in enumerate(zip(self.doc_tfidf, self.doc_norm)):
+            if norm == 0 or normq == 0: continue
+            dot = sum(vec.get(w,0.0) * vecq.get(w,0.0) for w in vecq)
+            sim = dot / (norm * normq)
+            if sim > best_sim:
+                best_sim, best_i = sim, i
+        logger.debug("Best sim=%.3f index=%d", best_sim, best_i)
+        if best_sim >= threshold:
+            return self.qa[best_i][1]
+        return "Извините, я пока не могу ответить на этот вопрос."
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import tempfile
+import pandas as pd
+from typing import List
+from src.DataBase import QAEntry
+
+def export_qna_to_temp_excel(data: List[QAEntry]) -> str:
+    df = pd.DataFrame([{
+        "ID": e.id,
+        "Question": e.question,
+        "Answer": e.answer
+    } for e in data])
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
+    df.to_excel(tmp.name, index=False)
+    tmp.close()
+    return tmp.name
+
+
+
+from src.excel_utils import export_qna_to_temp_excel
+
+@logger_decorator(logger)
+def load_base(self, message: UpdateMessage):
+    if not self.is_admin(message.sender_peer.id):
+        return self.bot.messaging.reply(message.peer, [message.mid], "Вы не можете выполнить эту команду.")
+
+    entries = self.kb_search.get_all()
+    temp_file_path = export_qna_to_temp_excel(entries)
+
+    self.bot.messaging.send_file(
+        peer=message.peer,
+        file_path=temp_file_path,
+        file_name="knowledge_base.xlsx",
+        message="Выгрузка базы Q&A"
+    )
+
+    self.bot.messaging.reply(message.peer, [message.mid], "База выгружена.")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import os
+import tempfile
+from src.excel_utils import export_qna_to_temp_excel
+from dialog_bot_sdk.utils import Logger
+
+logger = Logger(__name__)
+
+@logger_decorator(logger)
+def load_base(self, message: UpdateMessage):
+    if not self.is_admin(message.sender_peer.id):
+        return self.bot.messaging.reply(message.peer, [message.mid], "Вы не можете выполнить эту команду.")
+
+    entries = self.kb_search.get_all()
+    temp_file_path = export_qna_to_temp_excel(entries)
+
+    try:
+        self.bot.messaging.send_file(
+            peer=message.peer,
+            file_path=temp_file_path,
+            file_name="knowledge_base.xlsx",
+            message="Выгрузка базы Q&A"
+        )
+        self.bot.messaging.reply(message.peer, [message.mid], "База выгружена.")
+    finally:
+        try:
+            if os.path.exists(temp_file_path):
+                os.unlink(temp_file_path)
+                logger.info(f"Временный файл успешно удалён: {temp_file_path}")
+        except Exception as e:
+            logger.error(f"Ошибка при удалении временного файла {temp_file_path}: {e}")
+
+
+
