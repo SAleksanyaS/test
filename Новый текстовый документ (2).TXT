@@ -1,0 +1,1128 @@
+# ===========================
+#  OnBoarding Bot — config
+#  Стендозависимые значения ЗАПОЛНЯЮТСЯ ВО ВРЕМЯ ДЕПЛОЯ (Helm/CI/Secret).
+#  Никаких примерных хостов/ID здесь нет — только плейсхолдеры.
+# ===========================
+
+Bot:
+  # Путь до токена бота (секрет). Пример формата значения: /secrets/bot_token.yaml
+  token_path: "<SET_BY_ENV>"
+
+  # Сетевой endpoint бота (если используется). Можно оставить пустым, если ваш рантайм сам знает endpoint.
+  endpoint: "<SET_BY_ENV>"
+
+  # TLS: true/false. Обычно управляется стендом.
+  is_secure: <SET_BY_ENV_BOOL>   # true|false
+
+  # Таймаут сетевых вызовов SDK (сек)
+  timeout: 3
+
+  # Если инфраструктура подменяет протокол/порт во входящих URL — укажи сюда.
+  requests_url_replace:
+    protocol: "http"             # "http" | "https"
+    port: 80                     # число
+
+  # Лимитер запросов SDK (anti-spam)
+  rate_limiter_options:
+    max_calls: 100
+    period: 1
+
+Config:
+  # Идентификаторы групп/чатов, где бот имеет право читать/отвечать
+  flag_group: []                 # пример заполнения в CI: [123456789, 987654321]
+
+  # Идентификаторы админов (peer.id), кто может использовать админ-команды в ЛС
+  flag_admin: []                 # пример заполнения в CI: [111111111, 222222222]
+
+  # Текст для фолбэка «не знаю», если не задан командой /admin_response
+  admin_response_default: "@admin"
+
+DataBase:
+  # Путь до кредов БД (секрет с URL/логином/паролем/драйвером)
+  credentials_path: "<SET_BY_ENV>"
+
+  # Хосты БД (можно через запятую, если у вас баланс/реплика)
+  hosts: "<SET_BY_ENV>"          # пример значения в CI: db01.company.local:5432
+
+  # Имя БД и схема
+  name: "<SET_BY_ENV>"           # напр. onboarding_db
+  schema: "<SET_BY_ENV>"         # напр. public
+
+  # Доп. параметры драйвера (при необходимости). Если не нужны — оставь закомментированным.
+  # connect_args: {}
+
+Prometheus:
+  # Экспорт метрик. Порт — стендозависимый, но безопасно оставить дефолт, если не конфликтует.
+  port: 9100
+  address: "0.0.0.0"
+
+HealthCheck:
+  server:
+    host: "0.0.0.0"
+    port: 8080
+    liveness_path: "/health/live"
+    readiness_path: "/health/ready"
+  params:
+    deadline: 5
+
+# Команды бота. Имена команд — стабильные; описания можно менять под стенд.
+Commands:
+  start:
+    command: start
+    description: "Включить обработку сообщений"
+  stop:
+    command: stop
+    description: "Остановить обработку сообщений"
+
+  add_to_base:
+    command: add_to_base
+    description: "Добавить QnA (ЛС админа): /add_to_base Вопрос;Ответ"
+  delete_from_base:
+    command: delete_from_base
+    description: "Удалить QnA по ID (ЛС админа): /delete_from_base 123"
+  load_file_to_base:
+    command: load_file_to_base
+    description: "Массовая загрузка QnA из файла (строка: 'вопрос;ответ') — ЛС админа"
+  load_base:
+    command: load_base
+    description: "Экспорт всей базы QnA в CSV (ЛС админа)"
+
+  # Упрощённый триггер в группах:
+  #   /mode 1 — реагировать ТОЛЬКО на '?'
+  #   /mode 2 — реагировать ТОЛЬКО на упоминание '@bot' (см. OnBoardingBot.mention_handle)
+  mode:
+    command: mode
+    description: "Режим триггера в группах: 1 — '?', 2 — '@bot' (ЛС админа)"
+
+  # Установка хвоста фолбэка «не знаю»: всё, что введено после команды, запомнится.
+  #   /admin_response @dima @sasha
+  admin_response:
+    command: admin_response
+    description: "Фолбэк-упоминание ответственных: /admin_response <текст> (ЛС админа)"
+
+  # Управление стоп-словами (живут в таблице stopwords)
+  stopwords_add:
+    command: stopwords_add
+    description: "Добавить стоп-слова: /stopwords_add слово1, слово2 (ЛС админа)"
+  stopwords_delete:
+    command: stopwords_delete
+    description: "Удалить стоп-слова: /stopwords_delete слово1, слово2 (ЛС админа)"
+  stopwords_list:
+    command: stopwords_list
+    description: "Показать список стоп-слов (ЛС админа)"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+bot/src/OnBoardingBot.py
+# -*- coding: utf-8 -*-
+"""
+Оркестратор:
+- регистрирует команды
+- фильтрует доступ (админ/группа/ЛС)
+- применяет режим реакции '/mode'
+- прокидывает текст в поисковый движок
+- управляет CRUD БЗ и стоп-словами
+"""
+
+import csv
+import os
+import tempfile
+from tempfile import NamedTemporaryFile
+from typing import List
+
+from dialog_bot_sdk.bot import DialogBot
+from dialog_bot_sdk.entities.messaging import CommandHandler, UpdateMessage, MessageHandler, MessageContentType
+from dialog_bot_sdk.entities.sequence_and_updates import CustomUpdateHandler, CustomUpdateType
+from dialog_bot_sdk.entities.peers import PeerType
+from dialog_bot_sdk.utils import Logger
+
+from kits.HealthCheck import HealthCheck
+from kits.Metrics import Metrics
+from kits.utils import logger_decorator
+
+from src.Entities import Config
+from src.DataBase import DataBase, QAEntry
+from src.SearchEngine import SemanticSearchEngine
+
+logger = Logger(__name__)
+
+class OnBoardingBot:
+    def __init__(self, config: dict):
+        # Метрики и SDK
+        self.metrics = Metrics(**config["Prometheus"])
+        self.bot = DialogBot.create_bot(self.metrics.add_metrics_to_config(config["Bot"]))
+
+        # Health-check сервер
+        self.health = HealthCheck(**config["HealthCheck"]["server"])
+        self.health.set_default_bot_checkers(self.bot, **config["HealthCheck"]["params"])
+        self.deadline = config["HealthCheck"]["params"]["deadline"]
+
+        # Конфиг (админы/группы)
+        self.config = Config(**config["Config"])
+        # БД
+        self.db = DataBase(config["DataBase"])
+
+        # Инициализируем движок поиска из текущей БЗ и стоп-слов
+        qa = [(e.id, e.question, e.answer) for e in self.db.select_all_questions_answers()]
+        sw = set(self.db.select_all_stopwords())
+        self.engine = SemanticSearchEngine(qa, sw)
+
+        # Флаги процесса
+        self.processing_messages = True
+
+        # Простой режим реакции:
+        #  /mode 1 — реагировать только на '?'
+        #  /mode 2 — реагировать только на '@bot'
+        self.mode = 1
+        self.mention_handle = "@bot"
+
+        # Переменная для фолбэка «не знаю» (можно задать по умолчанию в config.yaml → Config.admin_response_default)
+        self.admin_response = (config.get("Config", {}).get("admin_response_default") or "@admin").strip()
+
+        # Регистрируем команды/хэндлеры
+        self.register_listeners(config["Commands"])
+        self.bot.updates.custom_update_handler([
+            CustomUpdateHandler(self.load_file_to_base, CustomUpdateType.UpdateFilePassed)
+        ])
+        self.bot.messaging.message_handler([
+            MessageHandler(self.handle_message, MessageContentType.TEXT_MESSAGE)
+        ])
+
+    # ---------------- регистрация команд ----------------
+
+    @logger_decorator(logger)
+    def register_listeners(self, commands: dict):
+        """Регистрируем набор команд согласно конфигу."""
+        self.bot.messaging.command_handler([
+            CommandHandler(self.start, **commands["start"]),
+            CommandHandler(self.stop_processing, **commands["stop"]),
+
+            CommandHandler(self.add_to_base, **commands["add_to_base"]),
+            CommandHandler(self.delete_from_base, **commands["delete_from_base"]),
+            CommandHandler(self.load_file_to_base, **commands["load_file_to_base"]),
+            CommandHandler(self.load_base, **commands["load_base"]),
+
+            # Режим реакции
+            CommandHandler(self.mode_cmd, **commands["mode"]),
+
+            # admin_response для фолбэка «не знаю»
+            CommandHandler(self.admin_response_cmd, **commands["admin_response"]),
+
+            # Стоп-слова
+            CommandHandler(self.stopwords_add, **commands["stopwords_add"]),
+            CommandHandler(self.stopwords_delete, **commands["stopwords_delete"]),
+            CommandHandler(self.stopwords_list, **commands["stopwords_list"]),
+        ])
+
+    # ---------------- запуск ----------------
+
+    @logger_decorator(logger)
+    def run(self):
+        """Запуск обработчиков и health-check-лупа."""
+        self.health.start()
+        self.bot.updates.on_updates(
+            do_read_message=True,
+            do_register_commands=True,
+            health_check_deadline=self.deadline
+        )
+
+    # ---------------- доступ ----------------
+
+    def is_admin(self, user_id: int) -> bool:
+        return user_id in self.config.flag_admin
+
+    # ---------------- режим реакции ----------------
+
+    def _mentioned(self, text: str) -> bool:
+        """Проверка упоминания бота по алиасу."""
+        return self.mention_handle.lower() in (text or "").lower()
+
+    def _should_process(self, peer_type: int, text: str) -> bool:
+        """
+        Решаем, обрабатывать ли сообщение в зависимости от режима:
+          - ЛС админам: всегда да.
+          - Группы: по self.mode.
+        """
+        if peer_type == PeerType.PEERTYPE_PRIVATE:
+            return True
+        if self.mode == 1:
+            return "?" in (text or "")
+        if self.mode == 2:
+            return self._mentioned(text)
+        return False
+
+    # ---------------- команды управления ----------------
+
+    @logger_decorator(logger)
+    def start(self, message: UpdateMessage):
+        if not self.is_admin(message.sender_peer.id):
+            return self.bot.messaging.reply(message.peer, [message.mid],
+                "Вы не администратор бота. Дальнейшие коммуникации ведутся в чате онбординга.")
+        self.processing_messages = True
+        self.bot.messaging.reply(message.peer, [message.mid], "Обработка сообщений включена.")
+
+    @logger_decorator(logger)
+    def stop_processing(self, message: UpdateMessage):
+        if not self.is_admin(message.sender_peer.id):
+            return self.bot.messaging.reply(message.peer, [message.mid],
+                "Вы не администратор бота. Дальнейшие коммуникации ведутся в чате онбординга.")
+        self.processing_messages = False
+        self.bot.messaging.reply(message.peer, [message.mid], "Обработка сообщений остановлена.")
+
+    # ---------------- CRUD БЗ ----------------
+
+    @logger_decorator(logger)
+    def add_to_base(self, message: UpdateMessage):
+        """Добавить QnA: /add_to_base Вопрос;Ответ  (только ЛС админа)"""
+        if not self.is_admin(message.sender_peer.id):
+            return self.bot.messaging.reply(message.peer, [message.mid],
+                "Вы не администратор бота. Дальнейшие коммуникации ведутся в чате онбординга.")
+        if message.peer.type == PeerType.PEERTYPE_PRIVATE:
+            text = message.message.text_message.text.replace("/add_to_base", "").strip()
+            parts = text.split(";", 1)
+            if len(parts) != 2:
+                return self.bot.messaging.reply(message.peer, [message.mid], "Формат: /add_to_base Вопрос;Ответ")
+            q, a = map(str.strip, parts)
+            self.db.insert_qna(q, a)
+            # Пересобираем индекс
+            qa = [(e.id, e.question, e.answer) for e in self.db.select_all_questions_answers()]
+            self.engine.refresh(qa)
+            self.bot.messaging.reply(message.peer, [message.mid], "Добавлено.")
+
+    @logger_decorator(logger)
+    def delete_from_base(self, message: UpdateMessage):
+        """Удалить QnA по ID: /delete_from_base 123  (только ЛС админа)"""
+        if not self.is_admin(message.sender_peer.id):
+            return self.bot.messaging.reply(message.peer, [message.mid],
+                "Вы не администратор бота. Дальнейшие коммуникации ведутся в чате онбординга.")
+        if message.peer.type == PeerType.PEERTYPE_PRIVATE:
+            text = message.message.text_message.text.replace("/delete_from_base", "").strip()
+            if not text.isdigit():
+                return self.bot.messaging.reply(message.peer, [message.mid], "Формат: /delete_from_base ID")
+            ok = self.db.delete_by_id(int(text))
+            qa = [(e.id, e.question, e.answer) for e in self.db.select_all_questions_answers()]
+            self.engine.refresh(qa)
+            self.bot.messaging.reply(message.peer, [message.mid], "Удалено." if ok else "Не найдено.")
+
+    @logger_decorator(logger)
+    def export_to_csv(self, data: List[QAEntry], file_path: str) -> None:
+        """Экспорт QnA в CSV (id,question,answer)."""
+        with open(file_path, "w", encoding="utf-8", newline="") as temp_file:
+            fieldnames = ["id", "question", "answer"]
+            writer = csv.DictWriter(temp_file, fieldnames=fieldnames)
+            writer.writeheader()
+            for entry in data:
+                writer.writerow({"id": entry.id, "question": entry.question, "answer": entry.answer})
+
+    @logger_decorator(logger)
+    def load_base(self, message: UpdateMessage):
+        """Слить базу знаний в CSV (только ЛС админа)."""
+        if not self.is_admin(message.sender_peer.id):
+            return self.bot.messaging.reply(message.peer, [message.mid],
+                "Вы не администратор бота. Дальнейшие коммуникации ведутся в чате онбординга.")
+        if message.peer.type == PeerType.PEERTYPE_PRIVATE:
+            entries = self.db.select_all_questions_answers()
+            self.bot.messaging.reply(message.peer, [message.mid], f"Записей: {len(entries)}")
+            file = NamedTemporaryFile(mode="w", delete=False, suffix=".csv", encoding="utf-8")
+            try:
+                self.export_to_csv(entries, file.name)
+                self.bot.messaging.send_file_sync(message.peer, file.name)
+            finally:
+                os.unlink(file.name)
+
+    @logger_decorator(logger)
+    def load_file_to_base(self, message: UpdateMessage) -> None:
+        """
+        Массовая загрузка QnA из файла: каждая строка "вопрос;ответ".
+        - Пустые строки игнорируются
+        - Некорректные строки помечаем "Пропущено: ..."
+        """
+        if not self.is_admin(message.sender_peer.id):
+            return
+        if message.peer.type != PeerType.PEERTYPE_PRIVATE:
+            return
+        if message.message.type != MessageContentType.DOCUMENT_MESSAGE:
+            return self.bot.messaging.reply(message.peer, [message.mid], "Сообщение не содержит файла.")
+        document = message.message.document_message
+        if document.file_id == 0 or document.access_hash == 0:
+            return self.bot.messaging.reply(message.peer, [message.mid], "Нет доступа к файлу.")
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix="." + document.name.split(".")[-1])
+        temp_file.close()
+        downloaded = self.bot.internal.downloading.download_file_sync(temp_file.name, document)
+        self.bot.messaging.reply(message.peer, [message.mid], f"Файл '{document.name}' получен, начинаю обработку...")
+        processed = 0
+        with open(downloaded.name, "r", encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if not s:
+                    continue
+                parts = s.split(";", 1)
+                if len(parts) != 2:
+                    self.bot.messaging.reply(message.peer, [message.mid], f"Пропущено: {s}")
+                    continue
+                q, a = map(str.strip, parts)
+                self.db.insert_qna(q, a)
+                processed += 1
+        os.unlink(downloaded.name)
+        qa = [(e.id, e.question, e.answer) for e in self.db.select_all_questions_answers()]
+        self.engine.refresh(qa)
+        self.bot.messaging.reply(message.peer, [message.mid], f"Обработано {processed} записей.")
+
+    # ---------------- стоп-слова ----------------
+
+    @logger_decorator(logger)
+    def stopwords_add(self, message: UpdateMessage):
+        """Добавить стоп-слова: /stopwords_add слово1, слово2 ...  (только ЛС админа)"""
+        if not self.is_admin(message.sender_peer.id):
+            return self.bot.messaging.reply(message.peer, [message.mid], "Вы не администратор.")
+        if message.peer.type != PeerType.PEERTYPE_PRIVATE:
+            return
+        text = message.message.text_message.text.replace("/stopwords_add", "").strip()
+        words = [w for w in text.replace(",", " ").split() if w]
+        added = self.db.insert_stopwords(words)
+        self.engine.update_stopwords(set(self.db.select_all_stopwords()))
+        self.bot.messaging.reply(message.peer, [message.mid], f"Добавлено стоп-слов: {added}")
+
+    @logger_decorator(logger)
+    def stopwords_delete(self, message: UpdateMessage):
+        """Удалить стоп-слова: /stopwords_delete слово1, слово2 ...  (только ЛС админа)"""
+        if not self.is_admin(message.sender_peer.id):
+            return self.bot.messaging.reply(message.peer, [message.mid], "Вы не администратор.")
+        if message.peer.type != PeerType.PEERTYPE_PRIVATE:
+            return
+        text = message.message.text_message.text.replace("/stopwords_delete", "").strip()
+        words = [w for w in text.replace(",", " ").split() if w]
+        deleted = self.db.delete_stopwords(words)
+        self.engine.update_stopwords(set(self.db.select_all_stopwords()))
+        self.bot.messaging.reply(message.peer, [message.mid], f"Удалено стоп-слов: {deleted}")
+
+    @logger_decorator(logger)
+    def stopwords_list(self, message: UpdateMessage):
+        """Список всех стоп-слов (только ЛС админа; шлём порциями)."""
+        if not self.is_admin(message.sender_peer.id):
+            return self.bot.messaging.reply(message.peer, [message.mid], "Вы не администратор.")
+        if message.peer.type != PeerType.PEERTYPE_PRIVATE:
+            return
+        words = sorted(set(self.db.select_all_stopwords()))
+        if not words:
+            return self.bot.messaging.reply(message.peer, [message.mid], "Список стоп-слов пуст.")
+        chunk = 80
+        for i in range(0, len(words), chunk):
+            part = words[i:i+chunk]
+            self.bot.messaging.reply(message.peer, [message.mid], ", ".join(part))
+
+    # ---------------- режимы /mode и admin_response ----------------
+
+    @logger_decorator(logger)
+    def mode_cmd(self, message: UpdateMessage):
+        """
+        /mode 1 | 2
+          1 — реагировать в группах только на '?'
+          2 — реагировать в группах только на '@bot'
+        """
+        if not self.is_admin(message.sender_peer.id):
+            return self.bot.messaging.reply(message.peer, [message.mid], "Вы не администратор.")
+        if message.peer.type != PeerType.PEERTYPE_PRIVATE:
+            return
+        text = message.message.text_message.text.replace("/mode", "").strip()
+        if text not in {"1", "2"}:
+            return self.bot.messaging.reply(
+                message.peer, [message.mid],
+                "Формат: /mode 1 | 2\n1 — реагировать на «?»\n2 — реагировать на «@bot»"
+            )
+        self.mode = int(text)
+        desc = "реагирую на «?»" if self.mode == 1 else f"реагирую на «{self.mention_handle}»"
+        self.bot.messaging.reply(message.peer, [message.mid], f"Режим установлен: {self.mode} ({desc})")
+
+    @logger_decorator(logger)
+    def admin_response_cmd(self, message: UpdateMessage):
+        """
+        /admin_response <любой текст>
+        Пример: /admin_response @dima @sasha
+        → фолбэк станет: "Извините, я не знаю ответа на этот вопрос. @dima @sasha подскажет"
+        """
+        if not self.is_admin(message.sender_peer.id):
+            return self.bot.messaging.reply(message.peer, [message.mid], "Вы не администратор.")
+        if message.peer.type != PeerType.PEERTYPE_PRIVATE:
+            return
+        full = message.message.text_message.text
+        payload = full[len("/admin_response"):].strip()
+        if not payload:
+            return self.bot.messaging.reply(message.peer, [message.mid],
+                f"Текущий admin_response: {self.admin_response}")
+        self.admin_response = payload
+        return self.bot.messaging.reply(message.peer, [message.mid],
+            f"admin_response установлен: {self.admin_response}")
+
+    # ---------------- обработка входящих сообщений ----------------
+
+    def _fallback(self) -> str:
+        """
+        Фраза, когда релевантного ответа нет:
+        подставляем admin_response, если задан.
+        """
+        tail = f" {self.admin_response} подскажет" if self.admin_response else ""
+        return f"Извините, я не знаю ответа на этот вопрос.{tail}"
+
+    @logger_decorator(logger)
+    def handle_message(self, message: UpdateMessage):
+        """Главный хэндлер: доступ → режим реакции → поиск → ответ/подсказки/фолбэк."""
+        if not self.processing_messages:
+            return
+
+        sender_id = message.sender_peer.id
+        chat_type = message.peer.type
+        text = message.message.text_message.text.strip()
+
+        # В ЛС общаемся только с админами
+        if chat_type == PeerType.PEERTYPE_PRIVATE and not self.is_admin(sender_id):
+            return self.bot.messaging.reply(
+                message.peer, [message.mid],
+                "Дальнейшие коммуникации ведутся в чате онбординга."
+            )
+
+        # Применяем режим реакции (в группах)
+        if not self._should_process(chat_type, text):
+            return
+
+        # Отправляем на семантический поиск
+        mode, payload = self.engine.query(text)
+
+        if mode == "answer":
+            return self.bot.messaging.reply(message.peer, [message.mid], payload)
+
+        if mode == "suggestions":
+            # Список похожих вопросов, чтобы уточнить намерение пользователя
+            if not payload:
+                return self.bot.messaging.reply(message.peer, [message.mid], self._fallback())
+            msg = "Возможно, вы имели в виду:\n" + "\n".join(f"{i+1}. {q}" for i, q in enumerate(payload))
+            return self.bot.messaging.reply(message.peer, [message.mid], msg)
+
+        # Релевантное не нашли
+        return self.bot.messaging.reply(message.peer, [message.mid], self._fallback())
+
+
+
+
+
+
+
+
+
+
+
+
+bot/src/SearchEngine.py
+# -*- coding: utf-8 -*-
+"""
+Многокритериальный семантический поиск без внешних библиотек.
+Метрики:
+  - TF-IDF (косинус)
+  - BM25
+  - Jaccard (по токенам)
+  - Косинус по символьным 3-граммам
+  - Нормированный Левенштейн (по строкам)
+Агрегация по весам; два порога для 3 режимов ответа.
+"""
+
+from typing import List, Tuple, Dict, Set
+from collections import Counter
+from math import log, sqrt
+from .TextUtils import normalize_tokens
+
+# --------- Векторные утилиты ---------
+def dot(a: List[float], b: List[float]) -> float:
+    return sum(x*y for x, y in zip(a, b))
+
+def norm(a: List[float]) -> float:
+    return sqrt(sum(x*x for x in a)) or 1e-12
+
+def cosine_list(a: List[float], b: List[float]) -> float:
+    return dot(a, b) / (norm(a) * norm(b))
+
+# --------- Левенштейн по строке ---------
+def levenshtein_ratio_str(a: str, b: str) -> float:
+    """
+    Возвращает схожесть [0..1] по расстоянию Левенштейна двух строк.
+    Используем строки (склейка токенов), чтобы сгладить короткие запросы.
+    """
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    la, lb = len(a), len(b)
+    # Защита от слишком больших квадратных матриц
+    if la * lb > 200000:
+        a, b = a[:300], b[:300]
+        la, lb = len(a), len(b)
+    dp = list(range(lb + 1))
+    for i in range(1, la + 1):
+        prev = dp[0]
+        dp[0] = i
+        ai = a[i - 1]
+        for j in range(1, lb + 1):
+            tmp = dp[j]
+            cost = 0 if ai == b[j - 1] else 1
+            dp[j] = min(dp[j] + 1, dp[j - 1] + 1, prev + cost)
+            prev = tmp
+    dist = dp[lb]
+    return 1.0 - dist / max(la, lb)
+
+# --------- Символьные n-граммы ---------
+def char_ngrams(s: str, n: int = 3) -> Counter:
+    if len(s) < n:
+        return Counter()
+    return Counter(s[i:i+n] for i in range(len(s) - n + 1))
+
+def cosine_counter(a: Counter, b: Counter) -> float:
+    if not a or not b:
+        return 0.0
+    keys = set(a.keys()) | set(b.keys())
+    va = [a.get(k, 0.0) for k in keys]
+    vb = [b.get(k, 0.0) for k in keys]
+    return cosine_list(va, vb)
+
+# --------- BM25 ---------
+class BM25:
+    def __init__(self, docs_tokens: List[List[str]], k1: float = 1.6, b: float = 0.75):
+        self.k1 = k1
+        self.b = b
+        self.docs = docs_tokens
+        self.N = len(self.docs)
+        self.df = Counter()
+        self.doc_len = [len(d) for d in docs_tokens]
+        self.avgdl = (sum(self.doc_len) / self.N) if self.N else 0.0
+        for d in self.docs:
+            for w in set(d):
+                self.df[w] += 1
+        self.idf = {}
+        for w, dfi in self.df.items():
+            # Мягкий idf, устойчив к редким/частым словам
+            self.idf[w] = log((self.N - dfi + 0.5) / (dfi + 0.5) + 1.0)
+
+    def score(self, q_tokens: List[str], d_tokens: List[str]) -> float:
+        score = 0.0
+        dl = len(d_tokens) or 1
+        K = self.k1 * (1 - self.b + self.b * dl / (self.avgdl or 1.0))
+        tf = Counter(d_tokens)
+        for w in q_tokens:
+            if w not in tf:
+                continue
+            idf = self.idf.get(w, 0.0)
+            freq = tf[w]
+            score += idf * (freq * (self.k1 + 1)) / (freq + K)
+        return max(0.0, score)
+
+# --------- TF-IDF ---------
+class TfIdf:
+    def __init__(self, docs_tokens: List[List[str]]):
+        self.docs = docs_tokens
+        self.vocab: List[str] = []
+        self.idf: Dict[str, float] = {}
+        self._build()
+
+    def _build(self):
+        df = Counter()
+        for d in self.docs:
+            for w in set(d):
+                df[w] += 1
+        self.vocab = sorted(df.keys())
+        N = max(1, len(self.docs))
+        for w in self.vocab:
+            dfi = df[w]
+            # Сглаженный IDF, защищён от деления на ноль
+            self.idf[w] = log((N + 1) / (dfi + 1)) + 1.0
+
+    def vector(self, tokens: List[str]) -> List[float]:
+        tf = Counter(tokens)
+        total = float(sum(tf.values())) or 1.0
+        return [(tf.get(w, 0.0) / total) * self.idf.get(w, 0.0) for w in self.vocab]
+
+# --------- Главный движок ---------
+class SemanticSearchEngine:
+    """
+    Внешний API: .query(text) -> (mode, payload)
+      - ("answer", str)            — высокий скор, возвращаем единственный ответ
+      - ("suggestions", List[str]) — средний скор, возвращаем 3-5 похожих вопросов
+      - ("none", None)             — ничего релевантного не нашли
+    """
+    def __init__(self, qa_pairs: List[tuple], stopwords: Set[str]):
+        # Сырой набор из БД: список троек (id, question, answer)
+        self.raw = qa_pairs
+        self.stopwords = set(stopwords)
+
+        # Подготовленные поля
+        self.ids: List[int] = []
+        self.questions: List[str] = []
+        self.answers: List[str] = []
+        self.tokens: List[List[str]] = []
+
+        self._build_indexes()
+
+        # Веса фич агрегатора (подобраны безопасно на старте)
+        self.w_tfidf = 0.35
+        self.w_bm25  = 0.35
+        self.w_jacc  = 0.10
+        self.w_char  = 0.10
+        self.w_lev   = 0.10
+
+        # Порог высокой уверенности и нижний порог для подсказок
+        self.high_threshold = 0.72
+        self.low_threshold  = 0.42
+
+    def _build_indexes(self):
+        """Собрать токены, индексы, предрассчитать модели TF-IDF/BM25/3-граммы."""
+        self.ids, self.questions, self.answers, self.tokens = [], [], [], []
+        for i, q, a in self.raw:
+            self.ids.append(i)
+            self.questions.append((q or "").strip())
+            self.answers.append((a or "").strip())
+            self.tokens.append(normalize_tokens(q, self.stopwords))
+
+        self.tfidf = TfIdf(self.tokens) if self.tokens else None
+        self.bm25 = BM25(self.tokens) if self.tokens else None
+        self.chargrams = [char_ngrams(" ".join(t), 3) for t in self.tokens]
+
+    def update_stopwords(self, stopwords: Set[str]):
+        """Обновить стоп-слова из БД и пересобрать индексы."""
+        self.stopwords = set(stopwords)
+        self._build_indexes()
+
+    def refresh(self, qa_pairs: List[tuple]):
+        """Заменить набор QnA (после изменений в БД) и пересобрать индексы."""
+        self.raw = qa_pairs
+        self._build_indexes()
+
+    def _score(self, q_tokens: List[str], idx: int) -> float:
+        """Считаем общий скор по набору метрик с весами."""
+        if not self.tokens or not self.tokens[idx]:
+            return 0.0
+
+        # tf-idf → косинус
+        s_tfidf = 0.0
+        if self.tfidf:
+            vq = self.tfidf.vector(q_tokens)
+            vd = self.tfidf.vector(self.tokens[idx])
+            s_tfidf = cosine_list(vq, vd)
+
+        # bm25 → грубо нормируем в [0..1]
+        s_bm = 0.0
+        if self.bm25:
+            raw = self.bm25.score(q_tokens, self.tokens[idx])
+            s_bm = raw / (raw + 1.5)
+
+        # Jaccard по множествам токенов
+        sq, sd = set(q_tokens), set(self.tokens[idx])
+        s_j = len(sq & sd) / (len(sq | sd) or 1)
+
+        # Косинус по символьным 3-граммам
+        from_str_q = " ".join(q_tokens)
+        s_c = cosine_counter(char_ngrams(from_str_q, 3), self.chargrams[idx])
+
+        # Нормированный Левенштейн по строкам
+        s_l = levenshtein_ratio_str(from_str_q, " ".join(self.tokens[idx]))
+
+        # Взвешенная сумма
+        score = (
+            self.w_tfidf * s_tfidf +
+            self.w_bm25  * s_bm     +
+            self.w_jacc  * s_j      +
+            self.w_char  * s_c      +
+            self.w_lev   * s_l
+        )
+        return max(0.0, min(1.0, score))
+
+    def query(self, text: str) -> Tuple[str, object]:
+        """
+        Главный метод поиска. Возвращает режим и нагрузку.
+        Отсеиваем пустые/маломощные запросы, затем ранжируем БЗ.
+        """
+        q_tokens = normalize_tokens(text, self.stopwords)
+
+        # защита от пустых/формальных сообщений (типа "привет", "коллеги", "?", "ок")
+        if not q_tokens:
+            return ("none", None)
+        if len(q_tokens) == 1 and len(q_tokens[0]) <= 3:
+            return ("none", None)
+
+        # быстрый "почти точный" матч: совпадение множеств токенов
+        for idx, t in enumerate(self.tokens):
+            if t and set(t) == set(q_tokens):
+                return ("answer", self.answers[idx])
+
+        # скорим все документы
+        scored = [(self._score(q_tokens, idx), idx) for idx in range(len(self.tokens))]
+        if not scored:
+            return ("none", None)
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        best, bidx = scored[0]
+
+        if best >= self.high_threshold:
+            return ("answer", self.answers[bidx])
+        elif best >= self.low_threshold:
+            # отдаём до 5 наиболее похожих вопросов в качестве подсказок
+            suggestions = []
+            for s, i in scored:
+                if s < self.low_threshold:
+                    break
+                suggestions.append(self.questions[i])
+                if len(suggestions) >= 5:
+                    break
+            # чистим дубликаты, если вдруг
+            suggestions = list(dict.fromkeys(suggestions))[:5]
+            return ("suggestions", suggestions)
+        else:
+            return ("none", None)
+
+
+
+
+
+bot/src/TextUtils.py
+# -*- coding: utf-8 -*-
+"""
+Лёгкие утилиты нормализации русского текста без внешних библиотек.
+- токенизация (кириллица/латиница/цифры)
+- фильтрация стоп-слов
+- очень бережный стемминг-эвристика
+"""
+
+import re
+from typing import List, Set
+
+RE_NONALNUM = re.compile(r"[^0-9a-zа-яё]+", flags=re.IGNORECASE)
+RE_SPACES = re.compile(r"\s+")
+
+def tokenize(text: str) -> List[str]:
+    """Нормализуем регистр, выкидываем пунктуацию и бьем на токены."""
+    text = (text or "").lower().strip()
+    text = RE_NONALNUM.sub(" ", text)
+    text = RE_SPACES.sub(" ", text).strip()
+    if not text:
+        return []
+    return text.split(" ")
+
+def rudimentary_stem(word: str) -> str:
+    """
+    Аккуратный "стеммер": обрезаем самые частые окончания/рефлексивность.
+    Не трогаем короткие слова, чтобы не ломать смысл.
+    """
+    w = word
+    if len(w) <= 3:
+        return w
+    if w.endswith(("ся", "сь")):
+        w = w[:-2]
+    for suf in ("ы", "и", "а", "я", "о", "е", "ю", "й", "ь"):
+        if len(w) > 4 and w.endswith(suf):
+            w = w[:-1]
+            break
+    for suf in ("ова", "ева", "ать", "ять", "еть", "ешь", "ишь", "очь"):
+        if len(w) > 5 and w.endswith(suf):
+            w = w[:-len(suf)]
+            break
+    return w
+
+def normalize_tokens(text: str, stopwords: Set[str]) -> List[str]:
+    """Токены → фильтр стоп-слов → стемминг → финальный список токенов."""
+    toks = tokenize(text)
+    out = []
+    for t in toks:
+        if t in stopwords:
+            continue
+        out.append(rudimentary_stem(t))
+    return [t for t in out if t]
+
+
+
+
+
+
+
+
+
+bot/src/DataBase.py
+# -*- coding: utf-8 -*-
+"""
+Абстракция над базой знаний.
+- Таблица qna(id, question, answer)
+- Таблица stopwords(id, word)
+"""
+
+from dataclasses import dataclass
+from enum import Enum
+from typing import List, Iterable
+
+from dialog_bot_sdk.utils import Logger
+from sqlalchemy import Table, Column, Integer, Text, MetaData, UniqueConstraint
+
+from kits import DB
+from kits.DB import Filter
+from kits.utils import logger_decorator
+
+logger = Logger(__name__)
+
+@dataclass(frozen=True)
+class QAEntry:
+    id: int
+    question: str
+    answer: str
+
+class QAEnum(Enum):
+    ID = "id"
+    QUESTION = "question"
+    ANSWER = "answer"
+
+class StopWordEnum(Enum:
+    ID = "id"
+    WORD = "word"
+
+class DataBase(DB.DataBase):
+    def __init__(self, cfg: dict):
+        """
+        cfg: словарь из config.yaml → DataBase
+        """
+        super().__init__(cfg)
+        self.meta = MetaData()
+        self.schema = cfg["schema"]
+
+        # Основная таблица QnA
+        self.qna_table = Table(
+            "qna", self.meta,
+            Column(QAEnum.ID.value, Integer, primary_key=True, autoincrement=True),
+            Column(QAEnum.QUESTION.value, Text, nullable=False),
+            Column(QAEnum.ANSWER.value, Text, nullable=False),
+            schema=self.schema
+        )
+
+        # Таблица стоп-слов
+        self.stopwords_table = Table(
+            "stopwords", self.meta,
+            Column(StopWordEnum.ID.value, Integer, primary_key=True, autoincrement=True),
+            Column(StopWordEnum.WORD.value, Text, nullable=False),
+            UniqueConstraint(StopWordEnum.WORD.value, name=f"uq_{self.schema}_stopwords_word"),
+            schema=self.schema
+        )
+
+        # Создаём таблицы при первом коннекте
+        self.meta.create_all(self.engine)
+
+    # ---------------- QnA ----------------
+
+    @logger_decorator(logger)
+    def insert_qna(self, question: str, answer: str) -> None:
+        """Добавить один вопрос/ответ в БЗ."""
+        self.insert(self.qna_table, {
+            QAEnum.QUESTION.value: (question or "").strip(),
+            QAEnum.ANSWER.value: (answer or "").strip()
+        })
+
+    @logger_decorator(logger)
+    def delete_by_id(self, entry_id: int) -> bool:
+        """Удалить QnA по id, вернуть True если удалили хоть одну запись."""
+        return self.delete(self.qna_table, filters=[Filter(QAEnum.ID.value, entry_id)])
+
+    @logger_decorator(logger)
+    def select_all_questions_answers(self) -> List[QAEntry]:
+        """Забрать всё содержимое БЗ QnA."""
+        rows = self.select(self.qna_table)
+        return [QAEntry(row.id, row.question, row.answer) for row in rows]
+
+    # ---------------- STOPWORDS ----------------
+
+    @logger_decorator(logger)
+    def insert_stopwords(self, words: Iterable[str]) -> int:
+        """
+        Добавить множество стоп-слов (дубликаты игнорируются за счёт уникального индекса).
+        Возвращает количество реально добавленных.
+        """
+        cnt = 0
+        for w in { (w or "").strip().lower() for w in words }:
+            if not w:
+                continue
+            try:
+                self.insert(self.stopwords_table, {StopWordEnum.WORD.value: w})
+                cnt += 1
+            except Exception:
+                # Нарвёмся на UniqueConstraint — пропускаем молча
+                pass
+        return cnt
+
+    @logger_decorator(logger)
+    def delete_stopwords(self, words: Iterable[str]) -> int:
+        """Удалить указанные стоп-слова. Возвращает фактическое число удалённых."""
+        count = 0
+        for w in { (w or "").strip().lower() for w in words }:
+            if not w:
+                continue
+            count += int(self.delete(self.stopwords_table, filters=[Filter(StopWordEnum.WORD.value, w)]))
+        return count
+
+    @logger_decorator(logger)
+    def select_all_stopwords(self) -> List[str]:
+        """Вернуть список всех стоп-слов."""
+        rows = self.select(self.stopwords_table)
+        return [row.word for row in rows]
+
+
+
+bot/liquibase/changelog.xml
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="
+           http://www.liquibase.org/xml/ns/dbchangelog
+           http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-3.8.xsd">
+
+    <!-- Создаём схему (если не существует) -->
+    <changeSet id="create-schema-qna" author="ai">
+        <sql>
+            CREATE SCHEMA IF NOT EXISTS "${schemaName}";
+            GRANT ALL PRIVILEGES ON SCHEMA "${schemaName}" TO "as_TUZ";
+        </sql>
+    </changeSet>
+
+    <!-- Основная таблица QnA -->
+    <changeSet id="create-qna" author="ai">
+        <createTable schemaName="${schemaName}" tableName="qna">
+            <column name="id" type="SERIAL">
+                <constraints primaryKey="true" nullable="false"/>
+            </column>
+            <column name="question" type="TEXT">
+                <constraints nullable="false"/>
+            </column>
+            <column name="answer" type="TEXT">
+                <constraints nullable="false"/>
+            </column>
+        </createTable>
+        <sql>
+            GRANT SELECT, UPDATE, INSERT, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA "${schemaName}" TO "as_TUZ";
+            GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA "${schemaName}" TO "as_TUZ";
+            GRANT USAGE ON SCHEMA "${schemaName}" TO "as_TUZ";
+        </sql>
+    </changeSet>
+
+    <!-- Таблица стоп-слов -->
+    <changeSet id="create-stopwords" author="ai">
+        <createTable schemaName="${schemaName}" tableName="stopwords">
+            <column name="id" type="SERIAL">
+                <constraints primaryKey="true" nullable="false"/>
+            </column>
+            <column name="word" type="TEXT">
+                <constraints nullable="false" unique="true"/>
+            </column>
+        </createTable>
+    </changeSet>
+
+</databaseChangeLog>
+
+
+
+
+
+
+
+
+
+
+
+
+bot/conf/config.yaml ← пример готового рабочего конфига
+
+# ВНИМАНИЕ: это пример. Подставь свои реальные значения токенов/хостов/портов/схемы БД.
+
+Bot:
+  token_path: /secrets/token.yaml
+  endpoint: my-bot-endpoint.company.local        # или оставь пустым, если используется istio шаблон
+  is_secure: false
+  timeout: 3
+  requests_url_replace:
+    protocol: http
+    port: 80
+  rate_limiter_options:
+    max_calls: 100
+    period: 1
+
+Config:
+  flag_group: [123456789]                        # id группы(потока), где бот работает
+  flag_admin: [111111111, 222222222]             # peer.id админов
+  admin_response_default: "@admin"               # что подставлять в фолбэк "не знаю"
+
+DataBase:
+  credentials_path: /secrets/db_creds.yaml
+  hosts: db01.company.local:5432
+  name: onboarding_db
+  schema: public
+  # connect_args: {}                             # при необходимости, например sslmode
+
+Prometheus:
+  port: 9100
+  address: 0.0.0.0
+
+HealthCheck:
+  server:
+    host: 0.0.0.0
+    port: 8080
+    liveness_path: /health/live
+    readiness_path: /health/ready
+  params:
+    deadline: 5
+
+# Команды бота. Имена используются при регистрации хэндлеров
+Commands:
+  start:
+    command: start
+    description: "Активирует обработку сообщений бота"
+  stop:
+    command: stop
+    description: "Приостанавливает обработку сообщений бота"
+
+  add_to_base:
+    command: add_to_base
+    description: "Добавляет вопрос и ответ в базу знаний"
+  delete_from_base:
+    command: delete_from_base
+    description: "Удаляет вопрос и ответ по ID"
+  load_file_to_base:
+    command: load_file_to_base
+    description: "Массовая загрузка QnA из файла (формат: 'вопрос;ответ' построчно)"
+  load_base:
+    command: load_base
+    description: "Экспорт всей базы знаний в CSV (только ЛС админа)"
+
+  # Упрощённый режим реакции (в группах):
+  # /mode 1 — реагируем на '?'
+  # /mode 2 — реагируем на '@bot'
+  mode:
+    command: mode
+    description: "Режим: 1 — '?' ; 2 — '@bot' (ЛС админа)"
+
+  # Текст, который подставляется в фолбэк «не знаю»
+  admin_response:
+    command: admin_response
+    description: "Задать хвост для фолбэка: /admin_response <текст> (ЛС админа)"
+
+  # Стоп-слова (живут в отдельной таблице БД)
+  stopwords_add:
+    command: stopwords_add
+    description: "Добавляет стоп-слова (через пробел/запятую) — ЛС админа"
+  stopwords_delete:
+    command: stopwords_delete
+    description: "Удаляет стоп-слова — ЛС админа"
+  stopwords_list:
+    command: stopwords_list
+    description: "Выводит список стоп-слов — ЛС админа"
+
